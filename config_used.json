@@ -1,0 +1,22 @@
+{
+  "csv_name": "Reviews Translated into English.csv",
+  "project_dir": "C:\\Users\\ramaz\\Downloads\\fake review detection\\github_code_package",
+  "output_dir": "C:\\Users\\ramaz\\Downloads\\fake review detection\\github_code_package\\outputs",
+  "data_dir": "C:\\Users\\ramaz\\Downloads\\fake review detection",
+  "seed": 42,
+  "test_size": 0.2,
+  "val_size": 0.2,
+  "split_max_tries": 40,
+  "ngram_range": [
+    1,
+    2
+  ],
+  "hash_n_features": 262144,
+  "srp_dim": 128,
+  "text_stop_words": "english",
+  "positive_class_name": "BiasFree=1 (positive class)",
+  "export_plots": true,
+  "zip_outputs": false,
+  "bootstrap_resamples": 10,
+  "bootstrap_seed": 42
+}

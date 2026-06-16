@@ -1,0 +1,21 @@
+{
+  "csv_path": "C:\\Users\\ramaz\\Downloads\\fake review detection\\Reviews Translated into English.csv",
+  "required_columns": [
+    "UserID",
+    "Menu",
+    "Review",
+    "Total",
+    "Taste",
+    "Quantity",
+    "Delivery",
+    "Date",
+    "HasPicture",
+    "BiasFree",
+    "RestaurantID"
+  ],
+  "n_rows_after_cleaning": 126653,
+  "positive_rate": 0.27157667011440706,
+  "n_users": 1221,
+  "n_restaurants": 135,
+  "has_picture_rate": 0.7435039043686292
+}
