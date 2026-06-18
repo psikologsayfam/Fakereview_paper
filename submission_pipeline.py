@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
+from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -31,10 +32,9 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.random_projection import SparseRandomProjection
 from sklearn.svm import LinearSVC
 
@@ -79,10 +79,12 @@ class Config:
     zip_outputs: bool = True
     bootstrap_resamples: int = 1000
     bootstrap_seed: int = 42
+    picture_context_folds: int = 5
 
 
 def safe_mkdir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    if path:
+        os.makedirs(path, exist_ok=True)
 
 
 def write_text(path: str, text: str) -> None:
@@ -95,7 +97,7 @@ def write_json(path: str, payload: Dict[str, Any]) -> None:
     write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
-def latex_escape(text: str) -> str:
+def latex_escape(text: Any) -> str:
     return (
         str(text)
         .replace("\\", "\\textbackslash{}")
@@ -118,29 +120,30 @@ def df_to_booktabs(df: pd.DataFrame, caption: str, label: str, floatfmt: str = "
             table[col] = table[col].map(lambda x: floatfmt % float(x) if np.isfinite(x) else "")
         else:
             table[col] = table[col].astype(str).map(latex_escape)
+
     headers = [latex_escape(col) for col in table.columns]
-    align = "l" * len(headers)
-    body_lines = []
+    align = "l" * max(1, len(headers))
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        f"\\begin{{tabular}}{{{align}}}",
+        "\\toprule",
+        " & ".join(headers) + r" \\",
+        "\\midrule",
+    ]
     for row in table.itertuples(index=False, name=None):
-        body_lines.append(" & ".join(str(cell) for cell in row) + r" \\")
-    latex = (
-        f"\\begin{{tabular}}{{{align}}}\n"
-        "\\toprule\n"
-        + " & ".join(headers)
-        + r" \\"
-        + "\n\\midrule\n"
-        + "\n".join(body_lines)
-        + "\n\\bottomrule\n"
-        "\\end{tabular}\n"
+        lines.append(" & ".join(str(cell) for cell in row) + r" \\")
+    lines.extend(
+        [
+            "\\bottomrule",
+            "\\end{tabular}",
+            f"\\caption{{{latex_escape(caption)}}}",
+            f"\\label{{{latex_escape(label)}}}",
+            "\\end{table}",
+            "",
+        ]
     )
-    return (
-        "\\begin{table}[t]\n"
-        "\\centering\n"
-        + latex
-        + f"\\caption{{{latex_escape(caption)}}}\n"
-        + f"\\label{{{latex_escape(label)}}}\n"
-        + "\\end{table}\n"
-    )
+    return "\n".join(lines)
 
 
 def clean_text(value: Any) -> str:
@@ -153,8 +156,7 @@ def clean_text(value: Any) -> str:
     return WS_RE.sub(" ", text).strip().lower()
 
 
-def stable_text_cast(series: pd.Series, missing_token: str = "nan") -> pd.Series:
-    # Preserve rows with missing text consistently across pandas versions.
+def stable_text_cast(series: pd.Series, missing_token: str = "") -> pd.Series:
     return series.where(series.notna(), missing_token).astype(str)
 
 
@@ -164,18 +166,23 @@ def canonical_text(value: Any) -> str:
     return WS_RE.sub(" ", text).strip()
 
 
+def is_valid_canonical_review(text: Any) -> bool:
+    text = str(text).strip().lower()
+    return text not in {"", "nan", "none", "null", "na", "n/a"}
+
+
 def upper_ratio(value: Any) -> float:
     text = str(value) if value is not None else ""
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
         return 0.0
-    return float(sum(1 for ch in letters if ch.isupper()) / max(1, len(letters)))
+    return float(sum(1 for ch in letters if ch.isupper()) / len(letters))
 
 
 def type_token_ratio(tokens: Sequence[str]) -> float:
     if not tokens:
         return 0.0
-    return float(len(set(tokens)) / max(1, len(tokens)))
+    return float(len(set(tokens)) / len(tokens))
 
 
 def iqr(values: np.ndarray) -> float:
@@ -185,40 +192,16 @@ def iqr(values: np.ndarray) -> float:
     return float(q75 - q25)
 
 
-def fit_robust_params(values: np.ndarray) -> Tuple[float, float]:
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return 0.0, 1.0
-    med = float(np.nanmedian(finite))
-    spread = float(iqr(finite))
-    if not np.isfinite(spread) or spread <= 0.0:
-        spread = float(np.nanstd(finite))
-    if not np.isfinite(spread) or spread <= 0.0:
-        spread = 1.0
-    return med, spread
-
-
-def robust_z(values: np.ndarray, med: float, spread: float, clip: float = 5.0) -> np.ndarray:
-    z = (values.astype(float) - med) / (spread if spread > 0 else 1.0)
-    z = np.clip(z, -clip, clip)
-    z[~np.isfinite(z)] = 0.0
-    return z
-
-
-def sigmoid(values: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-np.clip(values, -50.0, 50.0)))
-
-
 def resolve_csv_path(cfg: Config) -> str:
     candidates = [
         cfg.csv_name,
         os.path.join(cfg.project_dir, cfg.csv_name),
         os.path.join(cfg.data_dir, cfg.csv_name),
-        os.path.join(cfg.project_dir, cfg.data_dir, cfg.csv_name),
     ]
     for candidate in candidates:
         if os.path.isfile(candidate):
-            return candidate
+            return os.path.abspath(candidate)
+
     patterns = [
         os.path.join(cfg.data_dir, "**", cfg.csv_name),
         os.path.join(cfg.project_dir, "**", cfg.csv_name),
@@ -226,15 +209,9 @@ def resolve_csv_path(cfg: Config) -> str:
     for pattern in patterns:
         matches = glob.glob(pattern, recursive=True)
         if matches:
-            return matches[0]
-    raise FileNotFoundError(
-        f"Could not find {cfg.csv_name}. Checked: {candidates} and recursive matches under data/project."
-    )
+            return os.path.abspath(matches[0])
 
-
-def copy_csv_into_project(csv_path: str, cfg: Config) -> str:
-    del cfg
-    return os.path.abspath(csv_path)
+    raise FileNotFoundError(f"Could not find {cfg.csv_name}. Checked {candidates}.")
 
 
 def validate_schema(df: pd.DataFrame) -> None:
@@ -253,17 +230,23 @@ def build_base_frame(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     work["Date"] = pd.to_datetime(work["Date"], errors="coerce", utc=True)
     work = work.dropna(subset=["Date"]).copy()
+
     work["BiasFree"] = pd.to_numeric(work["BiasFree"], errors="coerce")
     work = work[work["BiasFree"].isin([0, 1])].copy()
     work["BiasFree"] = work["BiasFree"].astype(int)
+
     work["HasPicture"] = pd.to_numeric(work["HasPicture"], errors="coerce").fillna(0).astype(int)
-    work["Review_raw"] = stable_text_cast(work["Review"])
+    work["Review_raw"] = stable_text_cast(work["Review"], missing_token="")
     work["Review_clean"] = work["Review_raw"].map(clean_text)
     work["Review_can"] = work["Review_raw"].map(canonical_text)
-    work["Menu_clean"] = stable_text_cast(work["Menu"]).map(clean_text)
+    work["Menu_clean"] = stable_text_cast(work["Menu"], missing_token="").map(clean_text)
     work["TextCombined"] = (work["Review_clean"] + " " + work["Menu_clean"]).str.strip()
-    work = work[work["Review_can"].map(bool)].copy()
-    return work
+    work = work[work["Review_can"].map(is_valid_canonical_review)].copy()
+
+    for col in ["UserID", "RestaurantID"]:
+        work[col] = stable_text_cast(work[col], missing_token="unknown")
+
+    return work.reset_index(drop=True)
 
 
 class ContextFeatureBuilder:
@@ -277,11 +260,12 @@ class ContextFeatureBuilder:
         self.restaurant_day_count_map: Dict[Tuple[str, str], float] = {}
         self.restaurant_day_mean_map: Dict[str, float] = {}
         self.restaurant_day_std_map: Dict[str, float] = {}
-        self.multi_poster_users: set = set()
+        self.multi_poster_users: set[str] = set()
+        self.min_date: pd.Timestamp | None = None
 
     @staticmethod
-    def _compute_multi_poster_users(train_df: pd.DataFrame) -> set:
-        flagged = set()
+    def _compute_multi_poster_users(train_df: pd.DataFrame) -> set[str]:
+        flagged: set[str] = set()
         ordered = train_df.sort_values(["UserID", "Date"], kind="mergesort")
         for uid, group in ordered.groupby("UserID", sort=False):
             if len(group) < 3:
@@ -291,23 +275,30 @@ class ContextFeatureBuilder:
             left = 0
             counts: Dict[str, int] = {}
             distinct = 0
+
             for right in range(len(group)):
                 rest = rests[right]
                 counts[rest] = counts.get(rest, 0) + 1
                 if counts[rest] == 1:
                     distinct += 1
+
                 while ts[right] - ts[left] > np.timedelta64(24, "h"):
                     old = rests[left]
                     counts[old] -= 1
                     if counts[old] == 0:
                         distinct -= 1
                     left += 1
+
                 if (right - left + 1) >= 3 and distinct >= 2:
-                    flagged.add(uid)
+                    flagged.add(str(uid))
                     break
+
         return flagged
 
     def fit(self, train_df: pd.DataFrame) -> None:
+        train_df = train_df.copy()
+        self.min_date = train_df["Date"].min()
+
         grp = train_df.groupby("Review_can", sort=False)
         self.dup_mass_map = grp.size().astype(float).to_dict()
         self.dup_breadth_map = grp["RestaurantID"].nunique().astype(float).to_dict()
@@ -317,6 +308,7 @@ class ContextFeatureBuilder:
         ordered = train_df.sort_values(["UserID", "Date"], kind="mergesort").copy()
         ordered["prev_date"] = ordered.groupby("UserID")["Date"].shift(1)
         ordered["iri_hours"] = (ordered["Date"] - ordered["prev_date"]).dt.total_seconds() / 3600.0
+
         self.user_med_iri_map = (
             ordered.groupby("UserID")["iri_hours"].median().fillna(0.0).astype(float).to_dict()
         )
@@ -338,10 +330,10 @@ class ContextFeatureBuilder:
         ordered["day_key"] = ordered["Date"].dt.floor("D").astype(str)
         daily = ordered.groupby(["RestaurantID", "day_key"]).size().rename("restaurant_day_cnt").reset_index()
         for _, row in daily.iterrows():
-            self.restaurant_day_count_map[(str(row["RestaurantID"]), str(row["day_key"]))] = float(
-                row["restaurant_day_cnt"]
-            )
-        stats = daily.groupby("RestaurantID")["restaurant_day_cnt"].agg(["mean", "std"]).replace({0: np.nan})
+            key = (str(row["RestaurantID"]), str(row["day_key"]))
+            self.restaurant_day_count_map[key] = float(row["restaurant_day_cnt"])
+
+        stats = daily.groupby("RestaurantID")["restaurant_day_cnt"].agg(["mean", "std"])
         self.restaurant_day_mean_map = stats["mean"].fillna(0.0).astype(float).to_dict()
         self.restaurant_day_std_map = stats["std"].fillna(0.0).astype(float).to_dict()
         self.multi_poster_users = self._compute_multi_poster_users(ordered.dropna(subset=["Date"]))
@@ -349,6 +341,7 @@ class ContextFeatureBuilder:
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         work = df.copy()
         tokens = work["Review_clean"].str.split()
+
         work["wc"] = tokens.map(lambda seq: len(seq) if isinstance(seq, list) else 0).astype(float)
         work["ttr"] = tokens.map(lambda seq: type_token_ratio(seq if isinstance(seq, list) else [])).astype(float)
         work["char_len"] = work["Review_can"].map(lambda text: float(len(text)))
@@ -358,14 +351,19 @@ class ContextFeatureBuilder:
         work["day_of_week"] = work["Date"].dt.dayofweek.astype(float)
         work["hour"] = work["Date"].dt.hour.astype(float)
         work["month"] = work["Date"].dt.month.astype(float)
-        work["days_from_min"] = ((work["Date"] - work["Date"].min()).dt.total_seconds() / 86400.0).astype(float)
+
+        base_date = self.min_date
+        if base_date is None or pd.isna(base_date):
+            base_date = work["Date"].min()
+        work["days_from_min"] = ((work["Date"] - base_date).dt.total_seconds() / 86400.0).astype(float)
+
         work["dup_mass"] = work["Review_can"].map(self.dup_mass_map).fillna(1.0).astype(float)
         work["dup_breadth"] = work["Review_can"].map(self.dup_breadth_map).fillna(1.0).astype(float)
         work["user_degree"] = work["UserID"].map(self.user_degree_map).fillna(0.0).astype(float)
         work["restaurant_degree"] = work["RestaurantID"].map(self.restaurant_degree_map).fillna(0.0).astype(float)
         work["user_med_iri_hours"] = work["UserID"].map(self.user_med_iri_map).fillna(0.0).astype(float)
         work["user_iqr_iri_hours"] = work["UserID"].map(self.user_iqr_iri_map).fillna(0.0).astype(float)
-        work["multi_poster"] = work["UserID"].isin(self.multi_poster_users).astype(float)
+        work["multi_poster"] = work["UserID"].astype(str).isin(self.multi_poster_users).astype(float)
         work["day_key"] = work["Date"].dt.floor("D").astype(str)
 
         def _burst(rest_id: str, day_key: str) -> float:
@@ -427,7 +425,7 @@ def linear_svm_model(cfg: Config) -> Pipeline:
                 LinearSVC(
                     C=1.0,
                     class_weight="balanced",
-                    dual="auto",
+                    dual=False,
                     max_iter=5000,
                     random_state=cfg.seed,
                 ),
@@ -455,34 +453,35 @@ def picture_context_model(cfg: Config) -> Pipeline:
     )
 
 
-def safe_auc(y_true: np.ndarray, y_prob: np.ndarray, mode: str) -> float:
+def safe_auc(y_true: np.ndarray, y_score: np.ndarray, mode: str) -> float:
     if len(np.unique(y_true)) < 2:
         return float("nan")
     if mode == "roc":
-        return float(roc_auc_score(y_true, y_prob))
-    return float(average_precision_score(y_true, y_prob))
+        return float(roc_auc_score(y_true, y_score))
+    return float(average_precision_score(y_true, y_score))
 
 
-def find_best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    precision, recall, threshold = precision_recall_curve(y_true, y_prob)
+def find_best_f1_threshold(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    precision, recall, threshold = precision_recall_curve(y_true, y_score)
     if threshold.size == 0:
         return 0.5
     f1s = 2 * precision[:-1] * recall[:-1] / np.clip(precision[:-1] + recall[:-1], 1e-12, None)
     return float(threshold[int(np.nanargmax(f1s))])
 
 
-def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
-    y_pred = (y_prob >= threshold).astype(int)
+def compute_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
+    y_pred = (y_score >= threshold).astype(int)
     metrics = {
-        "roc_auc": safe_auc(y_true, y_prob, "roc"),
-        "pr_auc": safe_auc(y_true, y_prob, "pr"),
+        "roc_auc": safe_auc(y_true, y_score, "roc"),
+        "pr_auc": safe_auc(y_true, y_score, "pr"),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
     }
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    labels = [0, 1]
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=labels).ravel()
     metrics.update({"tn": float(tn), "fp": float(fp), "fn": float(fn), "tp": float(tp)})
     return metrics
 
@@ -493,6 +492,7 @@ def bootstrap_metric_interval(
     threshold: float,
     n_resamples: int,
     seed: int,
+    cluster_ids: np.ndarray | None = None,
 ) -> Dict[str, float]:
     rng = np.random.default_rng(seed)
     n = len(y_true)
@@ -501,14 +501,29 @@ def bootstrap_metric_interval(
     recall_vals: List[float] = []
     f1_vals: List[float] = []
 
+    unique_clusters = None
+    cluster_to_indices = None
+    if cluster_ids is not None:
+        cluster_ids = np.asarray(cluster_ids).astype(str)
+        if len(cluster_ids) != n:
+            raise ValueError("cluster_ids must have the same length as y_true.")
+        unique_clusters = np.unique(cluster_ids)
+        cluster_to_indices = {cluster: np.flatnonzero(cluster_ids == cluster) for cluster in unique_clusters}
+
     for _ in range(int(n_resamples)):
-        sample_idx = rng.integers(0, n, n)
+        if unique_clusters is None:
+            sample_idx = rng.integers(0, n, n)
+        else:
+            sampled_clusters = rng.choice(unique_clusters, size=len(unique_clusters), replace=True)
+            sample_idx = np.concatenate([cluster_to_indices[cluster] for cluster in sampled_clusters])
+
         y_boot = y_true[sample_idx]
         if len(np.unique(y_boot)) < 2:
             continue
+
         score_boot = y_score[sample_idx]
-        pr_auc_vals.append(safe_auc(y_boot, score_boot, "pr"))
         boot_metrics = compute_metrics(y_boot, score_boot, threshold)
+        pr_auc_vals.append(safe_auc(y_boot, score_boot, "pr"))
         precision_vals.append(boot_metrics["precision"])
         recall_vals.append(boot_metrics["recall"])
         f1_vals.append(boot_metrics["f1"])
@@ -523,8 +538,10 @@ def bootstrap_metric_interval(
     p_low, p_high = _bounds(precision_vals)
     r_low, r_high = _bounds(recall_vals)
     f1_low, f1_high = _bounds(f1_vals)
+
     return {
         "bootstrap_n": float(len(pr_auc_vals)),
+        "bootstrap_n_clusters": float(len(unique_clusters)) if unique_clusters is not None else float("nan"),
         "pr_auc_ci_low": pr_low,
         "pr_auc_ci_high": pr_high,
         "precision_ci_low": p_low,
@@ -544,10 +561,11 @@ def get_model_scores(model: Pipeline, matrix: np.ndarray) -> np.ndarray:
     raise AttributeError("Model must expose either predict_proba or decision_function.")
 
 
-def plot_roc_pr(y_true: np.ndarray, y_prob: np.ndarray, out_dir: str, tag: str) -> None:
+def plot_roc_pr(y_true: np.ndarray, y_score: np.ndarray, out_dir: str, tag: str) -> None:
     if len(np.unique(y_true)) < 2:
         return
-    fpr, tpr, _ = roc_curve(y_true, y_prob)
+
+    fpr, tpr, _ = roc_curve(y_true, y_score)
     plt.figure()
     plt.plot(fpr, tpr)
     plt.xlabel("False Positive Rate")
@@ -558,7 +576,7 @@ def plot_roc_pr(y_true: np.ndarray, y_prob: np.ndarray, out_dir: str, tag: str) 
     plt.savefig(os.path.join(out_dir, f"roc_{tag}.png"), dpi=160)
     plt.close()
 
-    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
     plt.figure()
     plt.plot(recall, precision)
     plt.xlabel("Recall")
@@ -592,14 +610,18 @@ def split_group(groups: np.ndarray, y: np.ndarray, cfg: Config) -> Tuple[np.ndar
         seed = cfg.seed + offset
         gss_test = GroupShuffleSplit(n_splits=1, test_size=cfg.test_size, random_state=seed)
         train_val_idx, test_idx = next(gss_test.split(all_idx, y, groups))
+
         groups_train_val = groups[train_val_idx]
         y_train_val = y[train_val_idx]
         gss_val = GroupShuffleSplit(n_splits=1, test_size=cfg.val_size, random_state=seed)
         train_rel, val_rel = next(gss_val.split(np.arange(len(train_val_idx)), y_train_val, groups_train_val))
+
         train_idx = train_val_idx[train_rel]
         val_idx = train_val_idx[val_rel]
+
         if len(np.unique(y[train_idx])) == len(np.unique(y[val_idx])) == len(np.unique(y[test_idx])) == 2:
             return train_idx, val_idx, test_idx
+
     raise RuntimeError("Could not create a valid group split.")
 
 
@@ -612,6 +634,19 @@ def leakage_check(review_can: pd.Series, train_idx: np.ndarray, val_idx: np.ndar
         "overlap_train_test": len(tr & te),
         "overlap_val_test": len(va & te),
     }
+
+
+def split_distribution(y: np.ndarray, train_idx: np.ndarray, val_idx: np.ndarray, test_idx: np.ndarray) -> Dict[str, Any]:
+    report: Dict[str, Any] = {}
+    for name, idx in {"train": train_idx, "validation": val_idx, "test": test_idx}.items():
+        yy = y[idx]
+        report[name] = {
+            "n": int(len(idx)),
+            "positive_rate": float(np.mean(yy)),
+            "n_positive": int(np.sum(yy == 1)),
+            "n_negative": int(np.sum(yy == 0)),
+        }
+    return report
 
 
 def learn_picture_context(
@@ -636,17 +671,42 @@ def learn_picture_context(
         "ttr",
         "char_len",
     ]
-    model = picture_context_model(cfg)
-    X_train = work.iloc[train_idx][pic_features].copy()
+
+    X_all = work[pic_features].copy()
+    X_train = X_all.iloc[train_idx].copy()
     y_train = work.iloc[train_idx]["BiasFree"].values.astype(int)
+
+    oof_scores = np.full(len(train_idx), np.nan, dtype=float)
+    class_counts = pd.Series(y_train).value_counts()
+    min_class_count = int(class_counts.min()) if not class_counts.empty else 0
+    n_splits = min(cfg.picture_context_folds, min_class_count)
+
+    if n_splits >= 2:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
+        for inner_train_rel, inner_val_rel in skf.split(X_train, y_train):
+            fold_model = picture_context_model(cfg)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fold_model.fit(X_train.iloc[inner_train_rel], y_train[inner_train_rel])
+            oof_scores[inner_val_rel] = fold_model.predict_proba(X_train.iloc[inner_val_rel])[:, 1]
+    else:
+        oof_scores[:] = float(np.mean(y_train)) if len(y_train) else 0.5
+
+    model = picture_context_model(cfg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model.fit(X_train, y_train)
-    work["pic_context_score"] = model.predict_proba(work[pic_features])[:, 1]
+
+    work["pic_context_score"] = model.predict_proba(X_all)[:, 1]
+    missing_oof = ~np.isfinite(oof_scores)
+    if missing_oof.any():
+        oof_scores[missing_oof] = model.predict_proba(X_train.iloc[missing_oof])[:, 1]
+    work.loc[work.index[train_idx], "pic_context_score"] = oof_scores
 
     clf = model.named_steps["clf"]
     scaler = model.named_steps["scaler"]
     imputer = model.named_steps["imputer"]
+
     coef_df = pd.DataFrame(
         {
             "feature": pic_features,
@@ -657,18 +717,20 @@ def learn_picture_context(
             "odds_ratio": np.exp(clf.coef_[0]),
         }
     ).sort_values("logit_coef", ascending=False)
+
     coef_df.to_csv(os.path.join(out_dir, "picture_context_coefficients.csv"), index=False)
     write_text(
         os.path.join(out_dir, "picture_context_coefficients.tex"),
         df_to_booktabs(
             coef_df.reset_index(drop=True),
             caption=(
-                "Train-only coefficients for the logistic submodel that learns the Picture-Context "
+                "Training-only coefficients for the logistic submodel that learns the Picture-Context "
                 "score from the raw picture indicator and coordination features."
             ),
             label=f"tab:pic_context_coef_{protocol_name}",
         ),
     )
+
     plt.figure(figsize=(8, max(4, 0.30 * len(coef_df))))
     plot_df = coef_df.sort_values("logit_coef")
     plt.barh(plot_df["feature"], plot_df["logit_coef"])
@@ -677,8 +739,11 @@ def learn_picture_context(
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "picture_context_coefficients.png"), dpi=160)
     plt.close()
+
     report = {
         "train_only": True,
+        "train_scores": "out_of_sample",
+        "n_oof_splits": int(n_splits),
         "intercept": float(clf.intercept_[0]),
         "features": pic_features,
         "n_features": len(pic_features),
@@ -707,10 +772,12 @@ def prepare_feature_sets(work: pd.DataFrame) -> Dict[str, np.ndarray]:
         "burst_z",
         "multi_poster",
     ]
+
     behavior = work[behavior_cols].astype(float).values
     text = work[[col for col in work.columns if col.startswith("text_srp_")]].astype(float).values
     has_picture = work[["HasPicture"]].astype(float).values
     pic_context = work[["pic_context_score"]].astype(float).values
+
     return {
         "text_only": text,
         "behavior_only": behavior,
@@ -735,17 +802,20 @@ def evaluate_matrix(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model.fit(matrix[train_idx], y[train_idx])
-    val_prob = get_model_scores(model, matrix[val_idx])
-    threshold = find_best_f1_threshold(y[val_idx], val_prob)
-    test_prob = get_model_scores(model, matrix[test_idx])
-    metrics = compute_metrics(y[test_idx], test_prob, threshold)
+
+    val_score = get_model_scores(model, matrix[val_idx])
+    threshold = find_best_f1_threshold(y[val_idx], val_score)
+
+    test_score = get_model_scores(model, matrix[test_idx])
+    metrics = compute_metrics(y[test_idx], test_score, threshold)
     metrics["threshold"] = float(threshold)
-    return metrics, test_prob
+    return metrics, test_score
 
 
 def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.DataFrame:
     out_dir = os.path.join(cfg.output_dir, protocol_name)
     safe_mkdir(out_dir)
+
     y = work0["BiasFree"].values.astype(int)
     if protocol_name == "baseline":
         train_idx, val_idx, test_idx = split_baseline(y, cfg)
@@ -754,44 +824,51 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
 
     leaks = leakage_check(work0["Review_can"], train_idx, val_idx, test_idx)
     write_json(os.path.join(out_dir, "leakage_check.json"), leaks)
+    write_json(os.path.join(out_dir, "split_distribution.json"), split_distribution(y, train_idx, val_idx, test_idx))
 
     builder = ContextFeatureBuilder()
     builder.fit(work0.iloc[train_idx].copy())
     work = builder.transform(work0.copy())
+
     text_matrix = build_text_matrix(work["TextCombined"], train_idx, cfg)
     text_cols = [f"text_srp_{dim}" for dim in range(text_matrix.shape[1])]
     text_df = pd.DataFrame(text_matrix, columns=text_cols, index=work.index)
     work = pd.concat([work, text_df], axis=1)
-    work, pic_report = learn_picture_context(work, train_idx, out_dir, protocol_name, cfg)
 
+    work, pic_report = learn_picture_context(work, train_idx, out_dir, protocol_name, cfg)
     feature_sets = prepare_feature_sets(work)
+
     rows: List[Dict[str, Any]] = []
     bootstrap_rows: List[Dict[str, Any]] = []
     scored_export_sets = {"combined_no_haspicture", "combined_raw_haspicture", "combined_pic_context"}
+
     for name, matrix in feature_sets.items():
-        metrics, test_prob = evaluate_matrix(matrix, y, train_idx, val_idx, test_idx, cfg)
-        row = {"protocol": protocol_name, "feature_set": name, "model": "logreg", **metrics}
-        rows.append(row)
+        metrics, test_score = evaluate_matrix(matrix, y, train_idx, val_idx, test_idx, cfg)
+        rows.append({"protocol": protocol_name, "feature_set": name, "model": "logreg", **metrics})
+
         if name in scored_export_sets:
             scored = work.iloc[test_idx].copy()
             scored["protocol"] = protocol_name
             scored["feature_set"] = name
-            scored["p_hat_biasfree"] = test_prob
+            scored["score_biasfree"] = test_score
             scored["thr_val"] = float(metrics["threshold"])
-            scored["pred_biasfree"] = (scored["p_hat_biasfree"] >= scored["thr_val"]).astype(int)
+            scored["pred_biasfree"] = (scored["score_biasfree"] >= scored["thr_val"]).astype(int)
             scored.to_csv(os.path.join(out_dir, f"test_scored_{name}.csv"), index=False)
 
+            cluster_ids = work.iloc[test_idx]["Review_can"].astype(str).values if protocol_name == "group" else None
             ci = bootstrap_metric_interval(
                 y_true=y[test_idx],
-                y_score=test_prob,
+                y_score=test_score,
                 threshold=float(metrics["threshold"]),
                 n_resamples=cfg.bootstrap_resamples,
                 seed=cfg.bootstrap_seed,
+                cluster_ids=cluster_ids,
             )
             bootstrap_rows.append(
                 {
                     "protocol": protocol_name,
                     "feature_set": name,
+                    "bootstrap_unit": "review_text_cluster" if cluster_ids is not None else "row",
                     "pr_auc": float(metrics["pr_auc"]),
                     "precision": float(metrics["precision"]),
                     "recall": float(metrics["recall"]),
@@ -799,8 +876,9 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
                     **ci,
                 }
             )
-        if cfg.export_plots and name in {"combined_no_haspicture", "combined_raw_haspicture", "combined_pic_context"}:
-            plot_roc_pr(y[test_idx], test_prob, out_dir, f"{protocol_name}_{name}")
+
+        if cfg.export_plots and name in scored_export_sets:
+            plot_roc_pr(y[test_idx], test_score, out_dir, f"{protocol_name}_{name}")
 
     results = pd.DataFrame(rows).sort_values(["protocol", "pr_auc"], ascending=[True, False]).reset_index(drop=True)
     results.to_csv(os.path.join(out_dir, "experiment_results.csv"), index=False)
@@ -809,8 +887,8 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
         df_to_booktabs(
             results,
             caption=(
-                f"Fixed-model experiment matrix for the {protocol_name} protocol. "
-                f"The positive class is defined consistently as {cfg.positive_class_name}."
+                f"Same-model experiment matrix for the {protocol_name} protocol. "
+                f"The positive class is {cfg.positive_class_name}."
             ),
             label=f"tab:{protocol_name}_experiment_matrix",
         ),
@@ -827,7 +905,7 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
         df_to_booktabs(
             pic_compare,
             caption=(
-                f"Direct comparison of raw HasPicture and the train-only learned Picture-Context "
+                f"Direct comparison of raw HasPicture and the learned Picture-Context "
                 f"signal under the {protocol_name} protocol."
             ),
             label=f"tab:{protocol_name}_pic_signal_compare",
@@ -872,6 +950,7 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
         "linear_svm": linear_svm_model(cfg),
     }
     robustness_rows: List[Dict[str, Any]] = []
+
     for model_name, model_obj in robustness_models.items():
         for feature_name in robustness_feature_sets:
             metrics, _ = evaluate_matrix(
@@ -891,6 +970,7 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
                     **metrics,
                 }
             )
+
     robustness = (
         pd.DataFrame(robustness_rows)
         .sort_values(["protocol", "classifier", "feature_set"], kind="mergesort")
@@ -932,6 +1012,7 @@ def run_protocol(work0: pd.DataFrame, cfg: Config, protocol_name: str) -> pd.Dat
         "n_rows_used": int(len(work)),
         "positive_rate": float(y.mean()),
         "leakage_check": leaks,
+        "split_distribution": split_distribution(y, train_idx, val_idx, test_idx),
         "picture_context_report": pic_report,
     }
     write_json(os.path.join(out_dir, "run_summary.json"), summary)
@@ -948,30 +1029,21 @@ Project CSV: `{os.path.basename(csv_path)}`
 - *Creating a bias-free dataset with food delivery app reviews under data poisoning attack*.
 - Data in Brief, Volume 55, August 2024, 110598.
 - DOI: https://doi.org/10.1016/j.dib.2024.110598
-- ScienceDirect: https://www.sciencedirect.com/science/article/pii/S2352340924005651
 
 ## Source dataset
 - Mendeley Data: *Bias-Free Dataset of Food Delivery App Reviews with Data Poisoning Attacks*
 - DOI: https://doi.org/10.17632/rnyrpzyw3h.2
-- URL: https://data.mendeley.com/datasets/rnyrpzyw3h/2
 
 ## Dataset facts used in this project
-- Rows in current CSV after load: {len(df):,}
+- Rows in current CSV after cleaning: {len(df):,}
 - Distinct restaurants: {df["RestaurantID"].nunique():,}
 - Distinct users: {df["UserID"].nunique():,}
 - Columns: {", ".join(df.columns.tolist())}
 - Positive class convention in code: `{cfg.positive_class_name}`
 
-## Data description distilled from the article and Mendeley page
-- Reviews were collected from 136 restaurants on a Korean food delivery app that used review events.
-- The article reports 128,668 collected reviews.
-- The dataset records review text, menu information, timestamp, photo presence, and multiple rating fields.
-- The article and Mendeley description state that restaurants demanded five-star reviews with photos during review events.
-- The dataset is positioned as a bias-aware / fairness-oriented review dataset rather than a hotel-review corpus.
-
 ## Submission-facing implication
-- In this experiment bundle, `BiasFree=1` is treated consistently as the positive class.
-- `HasPicture` is evaluated both as a raw indicator and as a train-only learned `Picture-Context` score.
+- `BiasFree=1` is treated as the positive class.
+- `HasPicture` is evaluated both as a raw indicator and as a learned Picture-Context score.
 - Duplicate-aware group splitting is defined on canonicalized review text to control template leakage.
 """
     write_text(os.path.join(cfg.project_dir, "data_notes.md"), data_notes)
@@ -979,12 +1051,12 @@ Project CSV: `{os.path.basename(csv_path)}`
     method_notes = """# Paper Snippets
 
 ## Positive class convention
-We use a single positive-class convention throughout all experiments: BiasFree=1 (legitimate). Accordingly, precision, recall, F1, ROC-AUC, and PR-AUC are always computed with respect to the same positive class, and predicted probabilities correspond to P(BiasFree=1).
+We use a single positive-class convention throughout all experiments: BiasFree=1 (legitimate). Accordingly, precision, recall, F1, ROC-AUC, and PR-AUC are always computed with respect to the same positive class.
 
 ## Learning the Picture-Context Score
-The Picture-Context Score is not hand-tuned. For each outer split, we fit a separate logistic submodel on the training partition only using the raw picture indicator and coordination features such as duplication mass, duplication breadth, burstiness, user cadence, and multi-poster behavior. The resulting train-only probability P(BiasFree=1 | HasPicture, Coordination) is then mapped to validation and test instances without refitting.
+The Picture-Context Score is not hand-tuned. For each outer split, we fit a separate logistic submodel using the raw picture indicator and coordination features such as duplication mass, duplication breadth, burstiness, user cadence, and multi-poster behavior. Training rows receive out-of-sample Picture-Context predictions, while validation and test rows receive predictions from the final submodel fitted only on the training partition.
 
-## Fixed-model split comparison
+## Same-model split comparison
 To isolate evaluation leakage from model choice, every feature family and every split protocol is evaluated with the same downstream classifier. This ensures that any baseline-vs-group performance gap is attributable to the split regime rather than to selecting different models per protocol.
 """
     write_text(os.path.join(cfg.project_dir, "paper_snippets.md"), method_notes)
@@ -1008,13 +1080,12 @@ def run_all(config_updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
     safe_mkdir(cfg.output_dir)
 
     csv_path = resolve_csv_path(cfg)
-    copied_csv = copy_csv_into_project(csv_path, cfg)
-    df = load_dataset(copied_csv)
+    df = load_dataset(csv_path)
     work0 = build_base_frame(df)
-    write_project_notes(cfg, copied_csv, work0)
+    write_project_notes(cfg, csv_path, work0)
 
     schema_report = {
-        "csv_path": copied_csv,
+        "csv_path": csv_path,
         "required_columns": REQUIRED_COLUMNS,
         "n_rows_after_cleaning": int(len(work0)),
         "positive_rate": float(work0["BiasFree"].mean()),
@@ -1033,25 +1104,26 @@ def run_all(config_updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
     tables_dir = os.path.join(cfg.output_dir, "tables")
     safe_mkdir(tables_dir)
 
-    picture_label_counts = pd.crosstab(work0["HasPicture"].astype(int), work0["BiasFree"].astype(int))
-    picture_label_row_pct = (
-        pd.crosstab(work0["HasPicture"].astype(int), work0["BiasFree"].astype(int), normalize="index") * 100.0
-    )
+    counts = pd.crosstab(work0["HasPicture"].astype(int), work0["BiasFree"].astype(int))
+    counts = counts.reindex(index=[0, 1], columns=[0, 1], fill_value=0)
+    row_totals = counts.sum(axis=1).replace(0, np.nan)
+    row_pct = counts.div(row_totals, axis=0).fillna(0.0) * 100.0
+
     picture_label_table = pd.DataFrame(
         [
             {
                 "HasPicture": "No picture",
-                "BiasFree=0 n": int(picture_label_counts.loc[0, 0]) if 0 in picture_label_counts.index and 0 in picture_label_counts.columns else 0,
-                "BiasFree=0 row %": float(picture_label_row_pct.loc[0, 0]) if 0 in picture_label_row_pct.index and 0 in picture_label_row_pct.columns else 0.0,
-                "BiasFree=1 n": int(picture_label_counts.loc[0, 1]) if 0 in picture_label_counts.index and 1 in picture_label_counts.columns else 0,
-                "BiasFree=1 row %": float(picture_label_row_pct.loc[0, 1]) if 0 in picture_label_row_pct.index and 1 in picture_label_row_pct.columns else 0.0,
+                "BiasFree=0 n": int(counts.loc[0, 0]),
+                "BiasFree=0 row %": float(row_pct.loc[0, 0]),
+                "BiasFree=1 n": int(counts.loc[0, 1]),
+                "BiasFree=1 row %": float(row_pct.loc[0, 1]),
             },
             {
                 "HasPicture": "Picture present",
-                "BiasFree=0 n": int(picture_label_counts.loc[1, 0]) if 1 in picture_label_counts.index and 0 in picture_label_counts.columns else 0,
-                "BiasFree=0 row %": float(picture_label_row_pct.loc[1, 0]) if 1 in picture_label_row_pct.index and 0 in picture_label_row_pct.columns else 0.0,
-                "BiasFree=1 n": int(picture_label_counts.loc[1, 1]) if 1 in picture_label_counts.index and 1 in picture_label_counts.columns else 0,
-                "BiasFree=1 row %": float(picture_label_row_pct.loc[1, 1]) if 1 in picture_label_row_pct.index and 1 in picture_label_row_pct.columns else 0.0,
+                "BiasFree=0 n": int(counts.loc[1, 0]),
+                "BiasFree=0 row %": float(row_pct.loc[1, 0]),
+                "BiasFree=1 n": int(counts.loc[1, 1]),
+                "BiasFree=1 row %": float(row_pct.loc[1, 1]),
             },
         ]
     )
@@ -1070,16 +1142,16 @@ def run_all(config_updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
     )
 
     split_effect = all_results[all_results["feature_set"] == "combined_pic_context"].copy()
-    split_effect.to_csv(os.path.join(tables_dir, "fixed_model_split_effect.csv"), index=False)
+    split_effect.to_csv(os.path.join(tables_dir, "same_model_split_effect.csv"), index=False)
     write_text(
-        os.path.join(tables_dir, "fixed_model_split_effect.tex"),
+        os.path.join(tables_dir, "same_model_split_effect.tex"),
         df_to_booktabs(
             split_effect,
             caption=(
-                "Fixed-model split comparison using the combined Picture-Context feature set. "
+                "Same-model split comparison using the combined Picture-Context feature set. "
                 "This isolates the effect of duplicate-aware evaluation from model choice."
             ),
-            label="tab:fixed_model_split_effect",
+            label="tab:same_model_split_effect",
         ),
     )
 
@@ -1116,17 +1188,14 @@ def run_all(config_updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
         os.path.join(tables_dir, "bootstrap_ci.tex"),
         df_to_booktabs(
             bootstrap_ci,
-            caption=(
-                "Percentile-bootstrap 95\\% confidence intervals for the key held-out comparisons "
-                "across both split protocols."
-            ),
+            caption="Percentile-bootstrap 95\\% confidence intervals for the key held-out comparisons.",
             label="tab:bootstrap_ci",
         ),
     )
 
     archive_path = zip_outputs(cfg) if cfg.zip_outputs else ""
     return {
-        "csv_path": copied_csv,
+        "csv_path": csv_path,
         "output_dir": cfg.output_dir,
         "archive_path": archive_path,
         "schema_report": schema_report,
@@ -1134,9 +1203,7 @@ def run_all(config_updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run the leakage-aware Yogiyo review-event benchmark audit."
-    )
+    parser = argparse.ArgumentParser(description="Run the leakage-aware Yogiyo review-event benchmark audit.")
     parser.add_argument("--project-dir", default=ROOT_DIR, help="Directory for notes and config exports.")
     parser.add_argument(
         "--output-dir",
@@ -1157,10 +1224,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of bootstrap resamples for confidence intervals.",
     )
     parser.add_argument(
-        "--no-zip",
-        action="store_true",
-        help="Skip creation of submission_outputs.zip.",
+        "--picture-context-folds",
+        type=int,
+        default=5,
+        help="Number of folds used to produce training Picture-Context scores.",
     )
+    parser.add_argument("--no-zip", action="store_true", help="Skip creation of submission_outputs.zip.")
     return parser.parse_args()
 
 
@@ -1174,6 +1243,7 @@ def main() -> None:
             "csv_name": args.csv_name,
             "seed": args.seed,
             "bootstrap_resamples": args.bootstrap_resamples,
+            "picture_context_folds": args.picture_context_folds,
             "zip_outputs": not args.no_zip,
         }
     )
